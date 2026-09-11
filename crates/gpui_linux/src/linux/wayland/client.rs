@@ -382,6 +382,8 @@ pub(crate) enum DataSourceKind {
 
 pub(crate) struct ExternalDrag {
     source: wl_data_source::WlDataSource,
+    icon_surface: Option<wl_surface::WlSurface>,
+    icon_buffer: Option<wl_buffer::WlBuffer>,
     uri_list: Vec<u8>,
     gnome_files: Vec<u8>,
     text_plain: Vec<u8>,
@@ -418,6 +420,127 @@ fn text_plain_paths(paths: &FileDragPaths) -> String {
         out.push('\n');
     }
     out
+}
+
+fn rgba_to_wayland_argb(rgba: &image::RgbaImage) -> Vec<u8> {
+    let (width, height) = rgba.dimensions();
+    let mut out = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in rgba.pixels() {
+        let [r, g, b, a] = pixel.0;
+        let alpha = a as u16;
+        let p_r = ((r as u16 * alpha) / 255) as u8;
+        let p_g = ((g as u16 * alpha) / 255) as u8;
+        let p_b = ((b as u16 * alpha) / 255) as u8;
+        out.push(p_b);
+        out.push(p_g);
+        out.push(p_r);
+        out.push(a);
+    }
+    out
+}
+
+fn create_drag_icon_surface(
+    globals: &Globals,
+    width: u32,
+    height: u32,
+    argb_data: &[u8],
+) -> Option<(wl_surface::WlSurface, wl_buffer::WlBuffer)> {
+    use std::io::Write;
+    use std::os::fd::{AsFd, FromRawFd};
+
+    let size = (width * height * 4) as usize;
+    if argb_data.len() != size {
+        return None;
+    }
+
+    let name = std::ffi::CStr::from_bytes_with_nul(b"gpui-dnd-icon\0").ok()?;
+    let fd = unsafe {
+        libc::memfd_create(
+            name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if file.set_len(size as u64).is_err() {
+        return None;
+    }
+    if file.write_all(argb_data).is_err() {
+        return None;
+    }
+
+    let pool = globals.shm.create_pool(file.as_fd(), size as i32, &globals.qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        (width * 4) as i32,
+        wl_shm::Format::Argb8888,
+        &globals.qh,
+        (),
+    );
+    pool.destroy();
+
+    let surface = globals.compositor.create_surface(&globals.qh, ());
+    surface.attach(Some(&buffer), 4, 4);
+    surface.damage(0, 0, width as i32, height as i32);
+    surface.commit();
+
+    Some((surface, buffer))
+}
+
+fn load_drag_icon_image(path: &std::path::Path) -> Option<(u32, u32, Vec<u8>)> {
+    let img = image::open(path).ok()?;
+    let size = 48;
+    let resized = img
+        .resize_exact(size, size, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let (w, h) = resized.dimensions();
+    let argb = rgba_to_wayland_argb(&resized);
+    Some((w, h, argb))
+}
+
+fn create_default_file_icon(is_dir: bool) -> (u32, u32, Vec<u8>) {
+    let size = 48;
+    let mut rgba = image::RgbaImage::new(size, size);
+    if is_dir {
+        for y in 0..size {
+            for x in 0..size {
+                let in_tab = x >= 4 && x <= 22 && y >= 8 && y <= 16;
+                let in_body = x >= 4 && x <= 44 && y >= 14 && y <= 40;
+                if in_tab || in_body {
+                    rgba.put_pixel(x, y, image::Rgba([66, 133, 244, 240]));
+                }
+            }
+        }
+    } else {
+        for y in 0..size {
+            for x in 0..size {
+                let in_card = x >= 8 && x <= 40 && y >= 6 && y <= 42;
+                let fold_corner = x >= 32 && y <= 14 && (x - 32) + 6 > y;
+                if in_card && !fold_corner {
+                    let is_border = x == 8 || x == 40 || y == 6 || y == 42;
+                    let is_line1 = y >= 20 && y <= 21 && x >= 14 && x <= 34;
+                    let is_line2 = y >= 26 && y <= 27 && x >= 14 && x <= 34;
+                    let is_line3 = y >= 32 && y <= 33 && x >= 14 && x <= 26;
+                    if is_border {
+                        rgba.put_pixel(x, y, image::Rgba([180, 185, 195, 255]));
+                    } else if is_line1 || is_line2 || is_line3 {
+                        rgba.put_pixel(x, y, image::Rgba([140, 150, 165, 255]));
+                    } else {
+                        rgba.put_pixel(x, y, image::Rgba([245, 247, 250, 240]));
+                    }
+                } else if in_card && fold_corner {
+                    rgba.put_pixel(x, y, image::Rgba([210, 215, 225, 255]));
+                }
+            }
+        }
+    }
+    let argb = rgba_to_wayland_argb(&rgba);
+    (size, size, argb)
 }
 
 pub struct ClickState {
@@ -537,6 +660,32 @@ impl WaylandClientStatePtr {
         let gnome_files = gnome_copied_files(paths);
         let text_plain = text_plain_paths(paths);
 
+        let (icon_w, icon_h, icon_argb) = paths
+            .entries()
+            .first()
+            .and_then(|(path, is_dir)| {
+                if !*is_dir {
+                    load_drag_icon_image(path)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                let is_dir = paths.entries().first().map_or(false, |(_, d)| *d);
+                create_default_file_icon(is_dir)
+            });
+
+        let icon_state = create_drag_icon_surface(
+            &state.globals,
+            icon_w,
+            icon_h,
+            &icon_argb,
+        );
+        let (icon_surface, icon_buffer) = match icon_state {
+            Some((s, b)) => (Some(s), Some(b)),
+            None => (None, None),
+        };
+
         let serial = state.serial_tracker.get(SerialKind::MousePress);
         let source =
             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
@@ -545,10 +694,12 @@ impl WaylandClientStatePtr {
         source.offer("text/plain".to_string());
         source.offer("text/plain;charset=utf-8".to_string());
         source.set_actions(DndAction::Copy | DndAction::Move);
-        data_device.start_drag(Some(&source), surface, None, serial.as_raw());
+        data_device.start_drag(Some(&source), surface, icon_surface.as_ref(), serial.as_raw());
 
         state.external_drag = Some(ExternalDrag {
             source,
+            icon_surface,
+            icon_buffer,
             uri_list: uri_list.into_bytes(),
             gnome_files: gnome_files.into_bytes(),
             text_plain: text_plain.into_bytes(),
@@ -2810,6 +2961,12 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
                 let Some(external_drag) = state.external_drag.take() else {
                     return;
                 };
+                if let Some(icon) = external_drag.icon_surface {
+                    icon.destroy();
+                }
+                if let Some(buffer) = external_drag.icon_buffer {
+                    buffer.destroy();
+                }
                 external_drag.source.destroy();
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Ended);
