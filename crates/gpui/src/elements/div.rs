@@ -637,6 +637,7 @@ impl Interactivity {
                 constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
             }),
             external_payload: None,
+            immediate: false,
         });
     }
 
@@ -663,6 +664,34 @@ impl Interactivity {
             drag_listener.external_payload.is_none(),
             "calling external_drag_payload more than once on the same element is not supported"
         );
+        drag_listener.immediate = false;
+        drag_listener.external_payload = Some(Box::new(move |value, window, cx| {
+            resolver(value.downcast_ref::<T>()?, window, cx)
+        }));
+    }
+
+    /// Registers a callback resolving a payload to offer the platform immediately when a drag
+    /// starts, without waiting for the pointer to leave the window.
+    pub fn immediate_external_drag_payload<T>(
+        &mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) where
+        Self: Sized,
+        T: 'static,
+    {
+        let Some(drag_listener) = self.drag_listener.as_mut() else {
+            debug_assert!(false, "immediate_external_drag_payload must be called after on_drag");
+            return;
+        };
+        debug_assert!(
+            drag_listener.value.as_ref().type_id() == TypeId::of::<T>(),
+            "immediate_external_drag_payload must use the same dragged value type as on_drag"
+        );
+        debug_assert!(
+            drag_listener.external_payload.is_none(),
+            "calling immediate_external_drag_payload more than once on the same element is not supported"
+        );
+        drag_listener.immediate = true;
         drag_listener.external_payload = Some(Box::new(move |value, window, cx| {
             resolver(value.downcast_ref::<T>()?, window, cx)
         }));
@@ -1641,6 +1670,21 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Registers a callback resolving a payload to offer the platform immediately when a drag
+    /// starts, without waiting for the pointer to leave the window.
+    /// The fluent API equivalent to [`Interactivity::immediate_external_drag_payload`].
+    fn immediate_external_drag_payload<T>(
+        mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+        T: 'static,
+    {
+        self.interactivity().immediate_external_drag_payload(resolver);
+        self
+    }
+
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
     /// Transitions caused by layout changes under a stationary mouse also invoke the callback.
@@ -1754,6 +1798,7 @@ pub(crate) struct DragListener {
     value: Arc<dyn Any>,
     render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
     external_payload: Option<ExternalDragPayloadResolver>,
+    immediate: bool,
 }
 
 type ExternalDragPayloadResolver =
@@ -2992,6 +3037,7 @@ impl Interactivity {
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
                                 external_payload_source,
+                                immediate: listener.immediate,
                             });
                             pending_mouse_down.take();
                             window.refresh();

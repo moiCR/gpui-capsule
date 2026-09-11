@@ -5341,6 +5341,7 @@ impl Window {
                             cursor_offset: position,
                             cursor_style: None,
                             external_payload_source: None,
+                            immediate: false,
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -5442,7 +5443,10 @@ impl Window {
         if mouse_move.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        if Bounds::new(Point::default(), self.viewport_size).contains(&mouse_move.position) {
+        let is_immediate = cx.active_drag.as_ref().map_or(false, |drag| drag.immediate);
+        if !is_immediate
+            && Bounds::new(Point::default(), self.viewport_size).contains(&mouse_move.position)
+        {
             return;
         }
         if !self.platform_window.can_start_external_drag() {

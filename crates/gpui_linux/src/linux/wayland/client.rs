@@ -382,7 +382,9 @@ pub(crate) enum DataSourceKind {
 
 pub(crate) struct ExternalDrag {
     source: wl_data_source::WlDataSource,
-    bytes: Vec<u8>,
+    uri_list: Vec<u8>,
+    gnome_files: Vec<u8>,
+    text_plain: Vec<u8>,
     window: WaylandWindowStatePtr,
 }
 
@@ -396,6 +398,26 @@ fn file_uri_list(paths: &FileDragPaths) -> String {
             list.push_str("\r\n");
             list
         })
+}
+
+fn gnome_copied_files(paths: &FileDragPaths) -> String {
+    let mut out = String::from("copy\n");
+    for (path, _) in paths.entries() {
+        if let Ok(url) = Url::from_file_path(path) {
+            out.push_str(url.as_str());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn text_plain_paths(paths: &FileDragPaths) -> String {
+    let mut out = String::new();
+    for (path, _) in paths.entries() {
+        out.push_str(&path.to_string_lossy());
+        out.push('\n');
+    }
+    out
 }
 
 pub struct ClickState {
@@ -512,17 +534,24 @@ impl WaylandClientStatePtr {
         if uri_list.is_empty() {
             return false;
         }
+        let gnome_files = gnome_copied_files(paths);
+        let text_plain = text_plain_paths(paths);
 
         let serial = state.serial_tracker.get(SerialKind::MousePress);
         let source =
             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
         source.offer(FILE_LIST_MIME_TYPE.to_string());
+        source.offer("x-special/gnome-copied-files".to_string());
+        source.offer("text/plain".to_string());
+        source.offer("text/plain;charset=utf-8".to_string());
         source.set_actions(DndAction::Copy | DndAction::Move);
         data_device.start_drag(Some(&source), surface, None, serial.as_raw());
 
         state.external_drag = Some(ExternalDrag {
             source,
-            bytes: uri_list.into_bytes(),
+            uri_list: uri_list.into_bytes(),
+            gnome_files: gnome_files.into_bytes(),
+            text_plain: text_plain.into_bytes(),
             window,
         });
         true
@@ -2763,11 +2792,15 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
             (DataSourceKind::Clipboard, wl_data_source::Event::Cancelled) => {
                 data_source.destroy();
             }
-            (DataSourceKind::Drag, wl_data_source::Event::Send { fd, .. }) => {
+            (DataSourceKind::Drag, wl_data_source::Event::Send { mime_type, fd }) => {
                 let Some(external_drag) = state.external_drag.as_ref() else {
                     return;
                 };
-                let bytes = external_drag.bytes.clone();
+                let bytes = match mime_type.as_str() {
+                    "x-special/gnome-copied-files" => external_drag.gnome_files.clone(),
+                    "text/plain" | "text/plain;charset=utf-8" => external_drag.text_plain.clone(),
+                    _ => external_drag.uri_list.clone(),
+                };
                 state.clipboard.send_bytes(fd, bytes);
             }
             (
