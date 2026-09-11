@@ -693,7 +693,7 @@ impl WaylandClientStatePtr {
         source.offer("x-special/gnome-copied-files".to_string());
         source.offer("text/plain".to_string());
         source.offer("text/plain;charset=utf-8".to_string());
-        source.set_actions(DndAction::Copy | DndAction::Move);
+        source.set_actions(DndAction::Copy);
         data_device.start_drag(Some(&source), surface, icon_surface.as_ref(), serial.as_raw());
 
         state.external_drag = Some(ExternalDrag {
