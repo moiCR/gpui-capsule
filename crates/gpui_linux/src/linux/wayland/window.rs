@@ -192,6 +192,7 @@ impl WaylandSurfaceState {
             return Ok(WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
                 layer_surface,
                 anchor: options.anchor,
+                keyboard_interactivity: Cell::new(options.keyboard_interactivity),
             }));
         }
 
@@ -302,6 +303,7 @@ pub struct WaylandXdgSurfaceState {
 pub struct WaylandLayerSurfaceState {
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     anchor: Anchor,
+    keyboard_interactivity: Cell<KeyboardInteractivity>,
 }
 
 pub struct WaylandPopupSurfaceState {
@@ -489,9 +491,14 @@ impl WaylandSurfaceState {
     fn set_keyboard_interactivity(&self, interactivity: KeyboardInteractivity) -> bool {
         if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
             layer_surface,
+            keyboard_interactivity,
             ..
         }) = self
         {
+            if keyboard_interactivity.get() == interactivity {
+                return false;
+            }
+            keyboard_interactivity.set(interactivity);
             layer_surface.set_keyboard_interactivity(
                 super::layer_shell::wayland_keyboard_interactivity(interactivity),
             );
