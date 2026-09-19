@@ -836,6 +836,19 @@ impl WaylandClientStatePtr {
             }
         }
     }
+
+    pub fn unlock_session_lock(&self) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        let is_locked = std::mem::take(&mut state.session_lock_is_locked);
+        if let Some(lock) = state.active_session_lock.take() {
+            if is_locked {
+                lock.unlock_and_destroy();
+            } else {
+                lock.destroy();
+            }
+        }
+    }
 }
 
 impl WaylandClientState {

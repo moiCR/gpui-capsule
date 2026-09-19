@@ -824,6 +824,10 @@ impl Drop for WaylandWindow {
 
         let client = state.client.clone();
 
+        if state.surface_state.is_session_lock() {
+            client.unlock_session_lock();
+        }
+
         state.renderer.destroy();
 
         // Destroy blur first, this has no dependencies.
