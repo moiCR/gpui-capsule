@@ -17,6 +17,9 @@ use wayland_client::{
     Proxy,
     protocol::{wl_callback, wl_output, wl_seat, wl_surface},
 };
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_surface_v1, ext_session_lock_v1,
+};
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_popup;
@@ -26,9 +29,6 @@ use wayland_protocols::xdg::shell::client::xdg_toplevel::{self};
 use wayland_protocols::{
     wp::fractional_scale::v1::client::wp_fractional_scale_v1,
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
-};
-use wayland_protocols::ext::session_lock::v1::client::{
-    ext_session_lock_surface_v1, ext_session_lock_v1,
 };
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
@@ -43,8 +43,9 @@ use gpui::{
     WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::{Anchor, KeyboardInteractivity, LayerShellNotSupportedError},
     popup::PopupOptions,
+    px,
     session_lock::SessionLockNotSupportedError,
-    px, size,
+    size,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
@@ -160,15 +161,12 @@ impl WaylandSurfaceState {
             };
 
             let Some(output) = target_output.as_ref() else {
-                return Err(anyhow::anyhow!("No valid Wayland output available for SessionLock"));
+                return Err(anyhow::anyhow!(
+                    "No valid Wayland output available for SessionLock"
+                ));
             };
 
-            let lock_surface = lock.get_lock_surface(
-                &surface,
-                output,
-                &globals.qh,
-                surface.id(),
-            );
+            let lock_surface = lock.get_lock_surface(&surface, output, &globals.qh, surface.id());
 
             return Ok(WaylandSurfaceState::SessionLock(
                 WaylandSessionLockSurfaceState { lock_surface },
@@ -408,9 +406,7 @@ impl WaylandSurfaceState {
             WaylandSurfaceState::Popup(WaylandPopupSurfaceState { xdg_surface, .. }) => {
                 xdg_surface.ack_configure(serial);
             }
-            WaylandSurfaceState::SessionLock(WaylandSessionLockSurfaceState {
-                lock_surface,
-            }) => {
+            WaylandSurfaceState::SessionLock(WaylandSessionLockSurfaceState { lock_surface }) => {
                 lock_surface.ack_configure(serial);
             }
         }
@@ -588,12 +584,14 @@ impl WaylandSurfaceState {
                 xdg_popup.destroy();
                 xdg_surface.destroy();
             }
-            WaylandSurfaceState::SessionLock(WaylandSessionLockSurfaceState {
-                lock_surface,
-            }) => {
+            WaylandSurfaceState::SessionLock(WaylandSessionLockSurfaceState { lock_surface }) => {
                 lock_surface.destroy();
             }
         }
+    }
+
+    pub fn is_session_lock(&self) -> bool {
+        matches!(self, WaylandSurfaceState::SessionLock(_))
     }
 }
 
@@ -928,7 +926,9 @@ impl WaylandWindow {
         });
 
         // Kick things off
-        surface.commit();
+        if !this.0.is_session_lock() {
+            surface.commit();
+        }
 
         Ok((this, surface.id()))
     }
@@ -1411,9 +1411,10 @@ impl WaylandWindowStatePtr {
                 };
 
                 let mut state = self.state.borrow_mut();
+                state.redraw_requested = true;
                 state.in_progress_configure = Some(InProgressConfigure {
                     size,
-                    fullscreen: true,
+                    fullscreen: false,
                     maximized: false,
                     resizing: false,
                     tiling: Tiling::default(),
@@ -2122,7 +2123,10 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_keyboard_interactivity(&self, interactivity: KeyboardInteractivity) {
         let state = self.borrow();
-        if state.surface_state.set_keyboard_interactivity(interactivity) {
+        if state
+            .surface_state
+            .set_keyboard_interactivity(interactivity)
+        {
             // Commit to apply it immediately, otherwise it only takes effect
             // on the next frame.
             state.surface.commit();
@@ -2155,10 +2159,9 @@ impl PlatformWindow for WaylandWindow {
             }
         }
 
-        // Commit so the new input region applies immediately. Otherwise it
-        // waits for the next frame, which could be the very click we want to
-        // allow passing through.
-        state.surface.commit();
+        if !state.surface_state.is_session_lock() {
+            state.surface.commit();
+        }
     }
 
     fn window_decorations(&self) -> Decorations {

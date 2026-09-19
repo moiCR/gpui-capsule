@@ -37,6 +37,9 @@ use wayland_client::{
         wl_shm_pool, wl_surface,
     },
 };
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+};
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
@@ -69,9 +72,6 @@ use wayland_protocols::{
 use wayland_protocols::{
     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
-};
-use wayland_protocols::ext::session_lock::v1::client::{
-    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
@@ -372,6 +372,7 @@ pub(crate) struct WaylandClientState {
     pub common: LinuxCommon,
     ime_enabled: Option<bool>,
     pub active_session_lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
+    pub session_lock_is_locked: bool,
 }
 
 pub struct DragState {
@@ -460,12 +461,8 @@ fn create_drag_icon_surface(
     }
 
     let name = std::ffi::CStr::from_bytes_with_nul(b"gpui-dnd-icon\0").ok()?;
-    let fd = unsafe {
-        libc::memfd_create(
-            name.as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd < 0 {
         return None;
     }
@@ -478,7 +475,9 @@ fn create_drag_icon_surface(
         return None;
     }
 
-    let pool = globals.shm.create_pool(file.as_fd(), size as i32, &globals.qh, ());
+    let pool = globals
+        .shm
+        .create_pool(file.as_fd(), size as i32, &globals.qh, ());
     let buffer = pool.create_buffer(
         0,
         width as i32,
@@ -681,12 +680,7 @@ impl WaylandClientStatePtr {
                 create_default_file_icon(is_dir)
             });
 
-        let icon_state = create_drag_icon_surface(
-            &state.globals,
-            icon_w,
-            icon_h,
-            &icon_argb,
-        );
+        let icon_state = create_drag_icon_surface(&state.globals, icon_w, icon_h, &icon_argb);
         let (icon_surface, icon_buffer) = match icon_state {
             Some((s, b)) => (Some(s), Some(b)),
             None => (None, None),
@@ -700,7 +694,12 @@ impl WaylandClientStatePtr {
         source.offer("text/plain".to_string());
         source.offer("text/plain;charset=utf-8".to_string());
         source.set_actions(DndAction::Copy);
-        data_device.start_drag(Some(&source), surface, icon_surface.as_ref(), serial.as_raw());
+        data_device.start_drag(
+            Some(&source),
+            surface,
+            icon_surface.as_ref(),
+            serial.as_raw(),
+        );
 
         state.external_drag = Some(ExternalDrag {
             source,
@@ -826,8 +825,13 @@ impl WaylandClientStatePtr {
         if was_session_lock {
             let has_remaining_lock_windows = state.windows.values().any(|w| w.is_session_lock());
             if !has_remaining_lock_windows {
+                let is_locked = std::mem::take(&mut state.session_lock_is_locked);
                 if let Some(lock) = state.active_session_lock.take() {
-                    lock.unlock_and_destroy();
+                    if is_locked {
+                        lock.unlock_and_destroy();
+                    } else {
+                        lock.destroy();
+                    }
                 }
             }
         }
@@ -1164,6 +1168,7 @@ impl WaylandClient {
             event_loop: Some(event_loop),
             ime_enabled: None,
             active_session_lock: None,
+            session_lock_is_locked: false,
         }));
 
         WaylandSource::new(conn, event_queue)
@@ -1832,11 +1837,14 @@ impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for WaylandClientStateP
         match event {
             ext_session_lock_v1::Event::Locked => {
                 log::info!("Wayland session lock acquired");
+                let client = this.get_client();
+                client.borrow_mut().session_lock_is_locked = true;
             }
             ext_session_lock_v1::Event::Finished => {
                 log::warn!("Wayland session lock finished or rejected by compositor");
                 let client = this.get_client();
                 let mut state = client.borrow_mut();
+                state.session_lock_is_locked = false;
                 state.active_session_lock = None;
                 let lock_windows: Vec<WaylandWindowStatePtr> = state
                     .windows
