@@ -70,6 +70,9 @@ use wayland_protocols::{
     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+};
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
@@ -221,6 +224,7 @@ pub struct Globals {
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    pub session_lock_manager: Option<ext_session_lock_manager_v1::ExtSessionLockManagerV1>,
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
@@ -265,6 +269,7 @@ impl Globals {
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
+            session_lock_manager: globals.bind(&qh, 1..=1, ()).ok(),
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
@@ -366,6 +371,7 @@ pub(crate) struct WaylandClientState {
     event_loop: Option<EventLoop<'static, WaylandClientStatePtr>>,
     pub common: LinuxCommon,
     ime_enabled: Option<bool>,
+    pub active_session_lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
 }
 
 pub struct DragState {
@@ -815,6 +821,16 @@ impl WaylandClientStatePtr {
         {
             state.cursor_hidden_window = Some(window);
         }
+        let was_session_lock = closed_window.is_session_lock();
+        drop(closed_window);
+        if was_session_lock {
+            let has_remaining_lock_windows = state.windows.values().any(|w| w.is_session_lock());
+            if !has_remaining_lock_windows {
+                if let Some(lock) = state.active_session_lock.take() {
+                    lock.unlock_and_destroy();
+                }
+            }
+        }
     }
 }
 
@@ -1147,6 +1163,7 @@ impl WaylandClient {
             startup_activation_token,
             event_loop: Some(event_loop),
             ime_enabled: None,
+            active_session_lock: None,
         }));
 
         WaylandSource::new(conn, event_queue)
@@ -1247,14 +1264,35 @@ impl LinuxClient for WaylandClient {
             _ => (state.keyboard_focused_window.clone(), None),
         };
 
-        let target_output = params.display_id.and_then(|display_id| {
-            let target_protocol_id: u64 = display_id.into();
-            state
-                .wl_outputs
-                .iter()
-                .find(|(id, _)| id.protocol_id() as u64 == target_protocol_id)
-                .map(|(_, output)| output.clone())
-        });
+        let target_output = params
+            .display_id
+            .and_then(|display_id| {
+                let target_protocol_id: u64 = display_id.into();
+                state
+                    .wl_outputs
+                    .iter()
+                    .find(|(id, _)| id.protocol_id() as u64 == target_protocol_id)
+                    .map(|(_, output)| output.clone())
+            })
+            .or_else(|| {
+                if matches!(params.kind, WindowKind::SessionLock(_)) {
+                    state.wl_outputs.values().next().cloned()
+                } else {
+                    None
+                }
+            });
+
+        let session_lock = if matches!(params.kind, WindowKind::SessionLock(_)) {
+            if state.active_session_lock.is_none() {
+                let Some(ref manager) = state.globals.session_lock_manager else {
+                    return Err(super::session_lock::SessionLockNotSupportedError.into());
+                };
+                state.active_session_lock = Some(manager.lock(&state.globals.qh, ()));
+            }
+            state.active_session_lock.clone()
+        } else {
+            None
+        };
 
         let appearance = state.common.appearance;
         let compositor_gpu = state.compositor_gpu.take();
@@ -1270,6 +1308,7 @@ impl LinuxClient for WaylandClient {
             parent,
             popup_grab,
             target_output,
+            session_lock,
         )?;
 
         if window.0.toplevel().is_some() {
@@ -1609,6 +1648,7 @@ delegate_noop!(WaylandClientStatePtr: ignore wl_region::WlRegion);
 delegate_noop!(WaylandClientStatePtr: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+delegate_noop!(WaylandClientStatePtr: ignore ext_session_lock_manager_v1::ExtSessionLockManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore xdg_positioner::XdgPositioner);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
 delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
@@ -1775,6 +1815,66 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ObjectId> for WaylandCl
 
         if should_close {
             // Close logic will be handled in drop_window()
+            window.close();
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &ext_session_lock_v1::ExtSessionLockV1,
+        event: <ext_session_lock_v1::ExtSessionLockV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_v1::Event::Locked => {
+                log::info!("Wayland session lock acquired");
+            }
+            ext_session_lock_v1::Event::Finished => {
+                log::warn!("Wayland session lock finished or rejected by compositor");
+                let client = this.get_client();
+                let mut state = client.borrow_mut();
+                state.active_session_lock = None;
+                let lock_windows: Vec<WaylandWindowStatePtr> = state
+                    .windows
+                    .values()
+                    .filter(|w| w.is_session_lock())
+                    .cloned()
+                    .collect();
+                drop(state);
+                for window in lock_windows {
+                    window.close();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ObjectId>
+    for WaylandClientStatePtr
+{
+    fn event(
+        this: &mut Self,
+        _: &ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+        event: <ext_session_lock_surface_v1::ExtSessionLockSurfaceV1 as Proxy>::Event,
+        surface_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = get_window(&mut state, surface_id) else {
+            return;
+        };
+
+        drop(state);
+        let should_close = window.handle_session_lock_surface_event(event);
+
+        if should_close {
             window.close();
         }
     }
