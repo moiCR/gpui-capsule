@@ -6,6 +6,10 @@ mod keystroke;
 #[expect(missing_docs)]
 pub mod layer_shell;
 
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+#[expect(missing_docs)]
+pub mod session_lock;
+
 /// Types for configuring parent-anchored popup windows such as menus, dropdowns and tooltips.
 pub mod popup;
 
@@ -993,6 +997,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_exclusive_zone(&self, _zone: Pixels) {}
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     fn set_exclusive_edge(&self, _edge: layer_shell::Anchor) {}
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn set_keyboard_interactivity(&self, _interactivity: layer_shell::KeyboardInteractivity) {}
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
@@ -2917,6 +2923,10 @@ pub enum WindowKind {
     /// docks, notifications or wallpapers.
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     LayerShell(layer_shell::LayerShellOptions),
+
+    /// A Wayland SessionLock window, used to display a screen locker that secures the session.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    SessionLock(session_lock::SessionLockOptions),
 
     /// A window that appears on top of its parent window and blocks interaction with it
     /// until the modal window is closed

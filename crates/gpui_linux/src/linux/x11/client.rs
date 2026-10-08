@@ -1604,6 +1604,10 @@ impl LinuxClient for X11Client {
         handle: AnyWindowHandle,
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
+        if matches!(params.kind, gpui::WindowKind::SessionLock(_)) {
+            return Err(gpui::session_lock::SessionLockNotSupportedError.into());
+        }
         let mut state = self.0.borrow_mut();
         let parent_window = state
             .keyboard_focused_window

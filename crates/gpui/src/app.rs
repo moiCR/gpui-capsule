@@ -735,6 +735,7 @@ pub struct App {
 
     pub(crate) actions: Rc<ActionRegistry>,
     pub(crate) active_drag: Option<AnyDrag>,
+    pub(crate) active_drag_immediate: bool,
     platform_owned_drag: Option<PlatformOwnedDrag>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
@@ -866,6 +867,7 @@ impl App {
                 flushing_effects: false,
                 pending_updates: 0,
                 active_drag: None,
+                active_drag_immediate: false,
                 platform_owned_drag: None,
                 background_executor,
                 foreground_executor,
@@ -2623,12 +2625,14 @@ impl App {
     /// Sets the current drag payload. Its recommended the window be refreshed when this is called.
     pub fn start_drag(&mut self, drag: AnyDrag) {
         debug_assert!(self.active_drag.is_none());
+        self.active_drag_immediate = false;
         self.active_drag = Some(drag);
     }
 
     /// Takes the current drag payload. Its recommended the window be refreshed when this is called.
     /// If there is a platform drag interop active, it is canceled.
     pub fn stop_drag(&mut self, window: &Window) -> Option<Arc<dyn Any>> {
+        self.active_drag_immediate = false;
         let drag = self.active_drag.take();
         if drag.is_some()
             && let Some(platform_drag) = self.platform_owned_drag.as_ref()
@@ -2656,6 +2660,7 @@ impl App {
     }
 
     pub(crate) fn hand_active_drag_to_platform(&mut self, source_window: WindowId) -> bool {
+        self.active_drag_immediate = false;
         let Some(drag) = self.active_drag.take() else {
             return false;
         };
@@ -2681,6 +2686,7 @@ impl App {
         let PlatformOwnedDragState::Suspended(drag) = state else {
             return false;
         };
+        self.active_drag_immediate = false;
         self.active_drag = Some(drag);
         true
     }
@@ -2708,6 +2714,7 @@ impl App {
             return false;
         }
         self.platform_owned_drag = None;
+        self.active_drag_immediate = false;
         self.active_drag = None;
         true
     }

@@ -2434,6 +2434,16 @@ impl Window {
         self.platform_window.set_exclusive_edge(edge);
     }
 
+    /// Sets the keyboard interactivity of a Wayland layer-shell surface.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn set_keyboard_interactivity(
+        &self,
+        interactivity: crate::layer_shell::KeyboardInteractivity,
+    ) {
+        self.platform_window
+            .set_keyboard_interactivity(interactivity);
+    }
+
     /// Start an interactive window resize operation if this window is resizable.
     pub fn start_window_resize(&self, edge: ResizeEdge) {
         if self.is_resizable {
@@ -5906,6 +5916,7 @@ impl Window {
                     self.mouse_position = position;
                     let source_window = self.handle.window_id();
                     if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
+                        cx.active_drag_immediate = false;
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
@@ -5940,6 +5951,7 @@ impl Window {
                 }
                 FileDropEvent::Exited => {
                     if !cx.hand_restored_drag_to_platform(self.handle.window_id()) {
+                        cx.active_drag_immediate = false;
                         cx.active_drag.take();
                     }
                     self.refresh();
@@ -6013,7 +6025,9 @@ impl Window {
         if mouse_move.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        if Bounds::new(Point::default(), self.viewport_size).contains(&mouse_move.position) {
+        if !cx.active_drag_immediate
+            && Bounds::new(Point::default(), self.viewport_size).contains(&mouse_move.position)
+        {
             return;
         }
         if !self.platform_window.can_start_external_drag() {
@@ -6026,6 +6040,7 @@ impl Window {
         else {
             return;
         };
+        cx.active_drag_immediate = false;
         let Some(payload) = payload_source(self, cx) else {
             return;
         };
@@ -6225,6 +6240,7 @@ impl Window {
             } else if event.is::<MouseUpEvent>() {
                 // If this was a mouse up event, cancel the active drag and redraw
                 // the window.
+                cx.active_drag_immediate = false;
                 cx.active_drag = None;
                 self.refresh();
             }
@@ -8043,6 +8059,7 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::FluentBuilder;
     use crate::{
         DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Font,
         FontMetrics, ImageSource, InlineLayout, InlineLayoutRequest, InputEvent,
@@ -8937,6 +8954,8 @@ mod tests {
 
     struct FileDragView {
         path: PathBuf,
+        immediate: bool,
+        resolutions: Rc<Cell<usize>>,
         observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
         observed_drops: Rc<RefCell<Vec<PathBuf>>>,
     }
@@ -8947,11 +8966,23 @@ mod tests {
                 .id("file-drag")
                 .size_full()
                 .on_drag(self.path.clone(), |_, _, _, cx| cx.new(|_| Empty))
-                .external_drag_payload(|path: &PathBuf, _, _| {
-                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
-                        path.clone(),
-                        true,
-                    )])))
+                .when(self.immediate, |element| {
+                    let resolutions = self.resolutions.clone();
+                    element.immediate_external_drag_payload(move |path: &PathBuf, _, _| {
+                        resolutions.set(resolutions.get() + 1);
+                        Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                            path.clone(),
+                            true,
+                        )])))
+                    })
+                })
+                .when(!self.immediate, |element| {
+                    element.external_drag_payload(|path: &PathBuf, _, _| {
+                        Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                            path.clone(),
+                            true,
+                        )])))
+                    })
                 })
                 .on_drag_move({
                     let observed_drag_moves = self.observed_drag_moves.clone();
@@ -8963,6 +8994,73 @@ mod tests {
                     let observed_drops = self.observed_drops.clone();
                     move |path: &PathBuf, _, _| observed_drops.borrow_mut().push(path.clone())
                 })
+        }
+    }
+
+    #[gpui::test]
+    fn immediate_file_drag_promotes_inside_and_resolves_once(cx: &mut TestAppContext) {
+        for accepted in [true, false] {
+            let resolutions = Rc::new(Cell::new(0));
+            let handle: AnyWindowHandle = cx
+                .add_window({
+                    let resolutions = resolutions.clone();
+                    move |_, _| FileDragView {
+                        path: PathBuf::from("/tmp/immediate-file"),
+                        immediate: true,
+                        resolutions,
+                        observed_drag_moves: Default::default(),
+                        observed_drops: Default::default(),
+                    }
+                })
+                .into();
+            cx.test_window(handle)
+                .set_start_external_drag_result(accepted);
+            cx.update_window(handle, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: point(px(10.), px(10.)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                for position in [
+                    point(px(20.), px(20.)),
+                    point(px(30.), px(30.)),
+                    point(px(-1.), px(30.)),
+                ] {
+                    window.dispatch_event(
+                        MouseMoveEvent {
+                            position,
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: Default::default(),
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    assert_eq!(resolutions.get(), 1);
+                    assert!(!cx.active_drag_immediate);
+                }
+                assert_eq!(cx.has_active_drag(), !accepted);
+                if accepted {
+                    assert!(cx.restore_platform_drag(handle.window_id()));
+                    assert!(!cx.active_drag_immediate);
+                }
+                assert!(cx.stop_active_drag(window));
+                let view = cx.new(|_| Empty);
+                cx.start_drag(AnyDrag::new(PathBuf::from("/tmp/next-file"), view));
+                assert!(!cx.active_drag_immediate);
+                assert!(cx.stop_active_drag(window));
+            })
+            .unwrap();
+            assert_eq!(
+                cx.test_window(handle).external_drag_files(),
+                [(PathBuf::from("/tmp/immediate-file"), true)]
+            );
         }
     }
 
@@ -8983,6 +9081,8 @@ mod tests {
                     let observed_drops = observed_drops.clone();
                     move |_, _| FileDragView {
                         path,
+                        immediate: false,
+                        resolutions: Rc::new(Cell::new(0)),
                         observed_drag_moves,
                         observed_drops,
                     }

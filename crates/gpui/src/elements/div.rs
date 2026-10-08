@@ -753,6 +753,7 @@ impl Interactivity {
         Self: Sized,
         T: 'static,
     {
+        self.immediate_external_drag = false;
         let Some(drag_listener) = self.drag_listener.take() else {
             debug_assert!(false, "external_drag_payload must be called after on_drag");
             return;
@@ -769,14 +770,24 @@ impl Interactivity {
                 let value = any_drag.value.clone();
                 let resolver = resolver.clone();
                 move |window, cx| {
-                    let value_ref = value
-                        .downcast_ref::<T>()
-                        .expect("drag value type does not match external payload type");
+                    let value_ref = value.downcast_ref::<T>()?;
                     resolver(value_ref, window, cx)
                 }
             }));
             any_drag
         });
+    }
+
+    /// Resolves an external payload when the drag starts, without waiting to leave the window.
+    /// Call after `on_drag` or `on_drag_alt`, using the dragged value type.
+    pub fn immediate_external_drag_payload<T>(
+        &mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) where
+        T: 'static,
+    {
+        self.external_drag_payload(resolver);
+        self.immediate_external_drag = true;
     }
 
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
@@ -1873,6 +1884,21 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Resolves an external payload when the drag starts, without waiting to leave the window.
+    /// The fluent API equivalent to [`Interactivity::immediate_external_drag_payload`].
+    fn immediate_external_drag_payload<T>(
+        mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+        T: 'static,
+    {
+        self.interactivity()
+            .immediate_external_drag_payload(resolver);
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -2654,6 +2680,7 @@ pub struct Interactivity {
     pub(crate) click_listeners: Vec<ClickListener>,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<DragListener>,
+    pub(crate) immediate_external_drag: bool,
     pub(crate) hover_listeners: Vec<HoverListener>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
@@ -3521,6 +3548,7 @@ impl Interactivity {
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
+                    let immediate_external_drag = self.immediate_external_drag;
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture || drag_listener.is_none() {
                             return;
@@ -3541,6 +3569,7 @@ impl Interactivity {
                             let cursor_offset = event.position - hitbox.origin;
                             let drag = listener(cursor_offset, drag_cursor_style, window, cx);
                             cx.start_drag(drag);
+                            cx.active_drag_immediate = immediate_external_drag;
                             pending_mouse_down.take();
                             window.refresh();
                             cx.stop_propagation();

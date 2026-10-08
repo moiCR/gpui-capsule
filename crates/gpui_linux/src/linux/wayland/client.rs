@@ -38,6 +38,9 @@ use wayland_client::{
         wl_shm_pool, wl_surface,
     },
 };
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+};
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_source_v1,
@@ -230,6 +233,7 @@ pub struct Globals {
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    pub session_lock_manager: Option<ext_session_lock_manager_v1::ExtSessionLockManagerV1>,
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
@@ -275,6 +279,7 @@ impl Globals {
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
+            session_lock_manager: globals.bind(&qh, 1..=1, ()).ok(),
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
@@ -380,6 +385,9 @@ pub(crate) struct WaylandClientState {
     event_loop: Option<EventLoop<'static, WaylandClientStatePtr>>,
     pub common: LinuxCommon,
     ime_enabled: Option<bool>,
+    active_session_lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
+    session_lock_lifecycle: super::session_lock::SessionLockLifecycle,
+    session_lock_surfaces: std::collections::HashSet<ObjectId>,
     pub(crate) icon_sizes: BTreeSet<i32>,
 }
 
@@ -397,8 +405,24 @@ pub(crate) enum DataSourceKind {
 
 pub(crate) struct ExternalDrag {
     source: wl_data_source::WlDataSource,
-    bytes: Vec<u8>,
+    icon_surface: Option<wl_surface::WlSurface>,
+    icon_buffer: Option<wl_buffer::WlBuffer>,
+    uri_list: Vec<u8>,
+    gnome_files: Vec<u8>,
+    text_plain: Vec<u8>,
     window: WaylandWindowStatePtr,
+}
+
+impl Drop for ExternalDrag {
+    fn drop(&mut self) {
+        if let Some(icon) = &self.icon_surface {
+            icon.destroy();
+        }
+        if let Some(buffer) = &self.icon_buffer {
+            buffer.destroy();
+        }
+        self.source.destroy();
+    }
 }
 
 fn file_uri_list(paths: &FileDragPaths) -> String {
@@ -411,6 +435,134 @@ fn file_uri_list(paths: &FileDragPaths) -> String {
             list.push_str("\r\n");
             list
         })
+}
+
+fn gnome_copied_files(paths: &FileDragPaths) -> String {
+    let mut out = String::from("copy\n");
+    for (path, _) in paths.entries() {
+        if let Ok(url) = Url::from_file_path(path) {
+            out.push_str(url.as_str());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn text_plain_paths(paths: &FileDragPaths) -> String {
+    let mut out = String::new();
+    for (path, _) in paths.entries() {
+        out.push_str(&path.to_string_lossy());
+        out.push('\n');
+    }
+    out
+}
+
+fn rgba_to_wayland_argb(rgba: &image::RgbaImage) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.as_raw().len());
+    for pixel in rgba.pixels() {
+        let [r, g, b, a] = pixel.0;
+        let alpha = a as u16;
+        let p_r = ((r as u16 * alpha) / 255) as u8;
+        let p_g = ((g as u16 * alpha) / 255) as u8;
+        let p_b = ((b as u16 * alpha) / 255) as u8;
+        let argb = u32::from(a) << 24 | u32::from(p_r) << 16 | u32::from(p_g) << 8 | u32::from(p_b);
+        out.extend_from_slice(&argb.to_ne_bytes());
+    }
+    out
+}
+
+fn create_drag_icon_surface(
+    globals: &Globals,
+    width: u32,
+    height: u32,
+    argb_data: &[u8],
+) -> Option<(wl_surface::WlSurface, wl_buffer::WlBuffer)> {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let stride = i32::try_from(width.checked_mul(4)?).ok()?;
+    let buffer_size = stride.checked_mul(i32::try_from(height).ok()?)?;
+    if width == 0 || height == 0 || argb_data.len() != usize::try_from(buffer_size).ok()? {
+        return None;
+    }
+    let memory = memfd::MemfdOptions::new()
+        .allow_sealing(true)
+        .create("gpui-dnd-icon")
+        .ok()?;
+    let mut file = memory.as_file();
+    file.set_len(u64::try_from(buffer_size).ok()?).ok()?;
+    file.write_all(argb_data).ok()?;
+
+    let pool = globals
+        .shm
+        .create_pool(file.as_fd(), buffer_size, &globals.qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        stride,
+        wl_shm::Format::Argb8888,
+        &globals.qh,
+        (),
+    );
+    pool.destroy();
+
+    let surface = globals.compositor.create_surface(&globals.qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage(0, 0, width as i32, height as i32);
+
+    Some((surface, buffer))
+}
+
+fn load_drag_icon_image(path: &std::path::Path) -> Option<(u32, u32, Vec<u8>)> {
+    let img = image::open(path).ok()?;
+    let size = 48;
+    let resized = img
+        .resize_exact(size, size, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let (w, h) = resized.dimensions();
+    let argb = rgba_to_wayland_argb(&resized);
+    Some((w, h, argb))
+}
+
+fn create_default_file_icon(is_dir: bool) -> (u32, u32, Vec<u8>) {
+    let size = 48;
+    let mut rgba = image::RgbaImage::new(size, size);
+    if is_dir {
+        for y in 0..size {
+            for x in 0..size {
+                let in_tab = x >= 4 && x <= 22 && y >= 8 && y <= 16;
+                let in_body = x >= 4 && x <= 44 && y >= 14 && y <= 40;
+                if in_tab || in_body {
+                    rgba.put_pixel(x, y, image::Rgba([66, 133, 244, 240]));
+                }
+            }
+        }
+    } else {
+        for y in 0..size {
+            for x in 0..size {
+                let in_card = x >= 8 && x <= 40 && y >= 6 && y <= 42;
+                let fold_corner = x >= 32 && y <= 14 && (x - 32) + 6 > y;
+                if in_card && !fold_corner {
+                    let is_border = x == 8 || x == 40 || y == 6 || y == 42;
+                    let is_line1 = y >= 20 && y <= 21 && x >= 14 && x <= 34;
+                    let is_line2 = y >= 26 && y <= 27 && x >= 14 && x <= 34;
+                    let is_line3 = y >= 32 && y <= 33 && x >= 14 && x <= 26;
+                    if is_border {
+                        rgba.put_pixel(x, y, image::Rgba([180, 185, 195, 255]));
+                    } else if is_line1 || is_line2 || is_line3 {
+                        rgba.put_pixel(x, y, image::Rgba([140, 150, 165, 255]));
+                    } else {
+                        rgba.put_pixel(x, y, image::Rgba([245, 247, 250, 240]));
+                    }
+                } else if in_card && fold_corner {
+                    rgba.put_pixel(x, y, image::Rgba([210, 215, 225, 255]));
+                }
+            }
+        }
+    }
+    let argb = rgba_to_wayland_argb(&rgba);
+    (size, size, argb)
 }
 
 pub struct ClickState {
@@ -439,6 +591,18 @@ pub(crate) enum PendingActivation {
 }
 
 impl WaylandClientState {
+    fn finish_session_lock(&mut self, action: Option<super::session_lock::LockAction>) {
+        let Some(action) = action else {
+            return;
+        };
+        if let Some(lock) = self.active_session_lock.take() {
+            match action {
+                super::session_lock::LockAction::Unlock => lock.unlock_and_destroy(),
+                super::session_lock::LockAction::Destroy => lock.destroy(),
+            }
+        }
+    }
+
     fn consume_startup_activation_token(&mut self, surface: &wl_surface::WlSurface) {
         let Some(startup_activation_token) = self.startup_activation_token.take() else {
             return;
@@ -512,6 +676,9 @@ impl WaylandClientStatePtr {
     ) -> bool {
         let client = self.get_client();
         let mut state = client.borrow_mut();
+        if state.external_drag.is_some() {
+            return false;
+        }
 
         let Some(window) = get_window(&mut state, &surface.id()) else {
             return false;
@@ -529,17 +696,56 @@ impl WaylandClientStatePtr {
         if uri_list.is_empty() {
             return false;
         }
+        let gnome_files = gnome_copied_files(paths);
+        let text_plain = text_plain_paths(paths);
+
+        let (icon_w, icon_h, icon_argb) = paths
+            .entries()
+            .first()
+            .and_then(|(path, is_dir)| {
+                if !*is_dir {
+                    load_drag_icon_image(path)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                let is_dir = paths.entries().first().map_or(false, |(_, d)| *d);
+                create_default_file_icon(is_dir)
+            });
+
+        let icon_state = create_drag_icon_surface(&state.globals, icon_w, icon_h, &icon_argb);
+        let (icon_surface, icon_buffer) = match icon_state {
+            Some((s, b)) => (Some(s), Some(b)),
+            None => (None, None),
+        };
 
         let serial = state.serial_tracker.get(SerialKind::MousePress);
         let source =
             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
         source.offer(FILE_LIST_MIME_TYPE.to_string());
-        source.set_actions(DndAction::Copy | DndAction::Move);
-        data_device.start_drag(Some(&source), surface, None, serial.as_raw());
+        source.offer("x-special/gnome-copied-files".to_string());
+        source.offer("text/plain".to_string());
+        source.offer("text/plain;charset=utf-8".to_string());
+        source.set_actions(DndAction::Copy);
+        data_device.start_drag(
+            Some(&source),
+            surface,
+            icon_surface.as_ref(),
+            serial.as_raw(),
+        );
+
+        if let Some(icon) = &icon_surface {
+            icon.commit();
+        }
 
         state.external_drag = Some(ExternalDrag {
             source,
-            bytes: uri_list.into_bytes(),
+            icon_surface,
+            icon_buffer,
+            uri_list: uri_list.into_bytes(),
+            gnome_files: gnome_files.into_bytes(),
+            text_plain: text_plain.into_bytes(),
             window,
         });
         true
@@ -655,7 +861,9 @@ impl WaylandClientStatePtr {
     pub fn drop_window(&self, surface_id: &ObjectId) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
-        let closed_window = state.windows.remove(surface_id).unwrap();
+        let Some(closed_window) = state.windows.remove(surface_id) else {
+            return;
+        };
         if let Some(window) = state.mouse_focused_window.take()
             && !window.ptr_eq(&closed_window)
         {
@@ -670,6 +878,16 @@ impl WaylandClientStatePtr {
             && !window.ptr_eq(&closed_window)
         {
             state.cursor_hidden_window = Some(window);
+        }
+    }
+
+    pub fn release_session_lock_surface(&self, surface_id: &ObjectId) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if state.session_lock_surfaces.remove(surface_id) && state.session_lock_surfaces.is_empty()
+        {
+            let action = state.session_lock_lifecycle.close();
+            state.finish_session_lock(action);
         }
     }
 }
@@ -1006,6 +1224,9 @@ impl WaylandClient {
             startup_activation_token,
             event_loop: Some(event_loop),
             ime_enabled: None,
+            active_session_lock: None,
+            session_lock_lifecycle: Default::default(),
+            session_lock_surfaces: Default::default(),
             icon_sizes: BTreeSet::default(),
         }));
 
@@ -1097,20 +1318,64 @@ impl LinuxClient for WaylandClient {
             _ => (state.keyboard_focused_window.clone(), None),
         };
 
-        let target_output = params.display_id.and_then(|display_id| {
-            let target_protocol_id: u64 = display_id.into();
-            state
-                .wl_outputs
-                .iter()
-                .find(|(id, _)| id.protocol_id() as u64 == target_protocol_id)
-                .map(|(_, output)| output.clone())
-        });
+        let target_output = params
+            .display_id
+            .and_then(|display_id| {
+                let target_protocol_id: u64 = display_id.into();
+                state
+                    .wl_outputs
+                    .iter()
+                    .find(|(id, _)| id.protocol_id() as u64 == target_protocol_id)
+                    .map(|(_, output)| output.clone())
+            })
+            .or_else(|| {
+                if matches!(params.kind, WindowKind::SessionLock(_)) && params.display_id.is_none()
+                {
+                    state.wl_outputs.values().next().cloned()
+                } else {
+                    None
+                }
+            });
+
+        let is_session_lock = matches!(params.kind, WindowKind::SessionLock(_));
+        if is_session_lock {
+            let output = target_output.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("No valid Wayland output available for SessionLock")
+            })?;
+            if params.display_id.is_some() && !state.wl_outputs.contains_key(&output.id()) {
+                anyhow::bail!("SessionLock display is unavailable");
+            }
+            if state.session_lock_lifecycle.is_closing()
+                && (state.active_session_lock.is_some() || !state.session_lock_surfaces.is_empty())
+            {
+                anyhow::bail!("Previous session lock is still closing");
+            }
+            if state
+                .windows
+                .values()
+                .any(|window| window.session_lock_output().as_ref() == Some(&output.id()))
+            {
+                anyhow::bail!("A session lock surface already exists for this output");
+            }
+        }
+        let session_lock = if is_session_lock {
+            if state.active_session_lock.is_none() {
+                let Some(ref manager) = state.globals.session_lock_manager else {
+                    return Err(super::session_lock::SessionLockNotSupportedError.into());
+                };
+                state.active_session_lock = Some(manager.lock(&state.globals.qh, ()));
+                state.session_lock_lifecycle = Default::default();
+            }
+            state.active_session_lock.clone()
+        } else {
+            None
+        };
 
         let appearance = state.common.appearance;
         let compositor_gpu = state.compositor_gpu.take();
         let gpu_requirements = state.gpu_requirements.clone();
 
-        let (window, surface_id) = WaylandWindow::new(
+        let result = WaylandWindow::new(
             handle,
             state.globals.clone(),
             state.gpu_context.clone(),
@@ -1122,7 +1387,21 @@ impl LinuxClient for WaylandClient {
             parent,
             popup_grab,
             target_output,
-        )?;
+            session_lock,
+        );
+        let (window, surface_id) = match result {
+            Ok(window) => window,
+            Err(error) => {
+                if is_session_lock && state.session_lock_surfaces.is_empty() {
+                    let action = state.session_lock_lifecycle.close();
+                    state.finish_session_lock(action);
+                }
+                return Err(error);
+            }
+        };
+        if is_session_lock {
+            state.session_lock_surfaces.insert(surface_id.clone());
+        }
 
         if window.0.toplevel().is_some() {
             state.consume_startup_activation_token(&window.0.surface());
@@ -1462,6 +1741,7 @@ delegate_noop!(WaylandClientStatePtr: ignore wl_region::WlRegion);
 delegate_noop!(WaylandClientStatePtr: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+delegate_noop!(WaylandClientStatePtr: ignore ext_session_lock_manager_v1::ExtSessionLockManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore xdg_positioner::XdgPositioner);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
 delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
@@ -1636,6 +1916,70 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ObjectId> for WaylandCl
 
         if should_close {
             // Close logic will be handled in drop_window()
+            window.close();
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        lock: &ext_session_lock_v1::ExtSessionLockV1,
+        event: <ext_session_lock_v1::ExtSessionLockV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        if state.active_session_lock.as_ref() != Some(lock) {
+            return;
+        }
+        match event {
+            ext_session_lock_v1::Event::Locked => {
+                let action = state.session_lock_lifecycle.locked();
+                state.finish_session_lock(action);
+            }
+            ext_session_lock_v1::Event::Finished => {
+                let action = state.session_lock_lifecycle.finished();
+                state.finish_session_lock(Some(action));
+                let lock_windows: Vec<_> = state
+                    .windows
+                    .values()
+                    .filter(|window| window.is_session_lock())
+                    .cloned()
+                    .collect();
+                drop(state);
+                for window in lock_windows {
+                    window.close();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ObjectId>
+    for WaylandClientStatePtr
+{
+    fn event(
+        this: &mut Self,
+        _: &ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+        event: <ext_session_lock_surface_v1::ExtSessionLockSurfaceV1 as Proxy>::Event,
+        surface_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = get_window(&mut state, surface_id) else {
+            return;
+        };
+
+        drop(state);
+        let should_close = window.handle_session_lock_surface_event(event);
+
+        if should_close {
             window.close();
         }
     }
@@ -2885,25 +3229,40 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
             (DataSourceKind::Clipboard, wl_data_source::Event::Cancelled) => {
                 data_source.destroy();
             }
-            (DataSourceKind::Drag, wl_data_source::Event::Send { fd, .. }) => {
+            (DataSourceKind::Drag, wl_data_source::Event::Send { mime_type, fd }) => {
                 let Some(external_drag) = state.external_drag.as_ref() else {
                     return;
                 };
-                let bytes = external_drag.bytes.clone();
+                if &external_drag.source != data_source {
+                    return;
+                }
+                let bytes = match mime_type.as_str() {
+                    "x-special/gnome-copied-files" => external_drag.gnome_files.clone(),
+                    "text/plain" | "text/plain;charset=utf-8" => external_drag.text_plain.clone(),
+                    _ => external_drag.uri_list.clone(),
+                };
                 state.clipboard.send_bytes(fd, bytes);
             }
             (
                 DataSourceKind::Drag,
                 wl_data_source::Event::DndFinished | wl_data_source::Event::Cancelled,
             ) => {
+                if !state
+                    .external_drag
+                    .as_ref()
+                    .is_some_and(|drag| &drag.source == data_source)
+                {
+                    return;
+                }
                 let Some(external_drag) = state.external_drag.take() else {
                     return;
                 };
-                external_drag.source.destroy();
+                let window = external_drag.window.clone();
+                drop(external_drag);
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Ended);
                 drop(state);
-                external_drag.window.handle_input(input);
+                window.handle_input(input);
             }
             _ => {}
         }
@@ -3063,6 +3422,37 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn drag_formats_preserve_spaces_unicode_and_copy_action() {
+        let paths = FileDragPaths::new([(PathBuf::from("/tmp/á file"), false)]);
+        assert_eq!(file_uri_list(&paths), "file:///tmp/%C3%A1%20file\r\n");
+        assert_eq!(
+            gnome_copied_files(&paths),
+            "copy\nfile:///tmp/%C3%A1%20file\n"
+        );
+        assert_eq!(text_plain_paths(&paths), "/tmp/á file\n");
+    }
+
+    #[test]
+    fn drag_argb_is_premultiplied_and_native_endian() {
+        let rgba = image::RgbaImage::from_pixel(1, 1, image::Rgba([200, 100, 50, 128]));
+        assert_eq!(rgba_to_wayland_argb(&rgba), 0x80643219_u32.to_ne_bytes());
+        let rgba = image::RgbaImage::from_pixel(1, 1, image::Rgba([200, 100, 50, 0]));
+        assert_eq!(rgba_to_wayland_argb(&rgba), [0; 4]);
+    }
+
+    #[test]
+    fn unavailable_thumbnail_has_distinct_file_and_folder_fallbacks() {
+        assert!(
+            load_drag_icon_image(std::path::Path::new("/nonexistent/gpui-drag-image")).is_none()
+        );
+        let file = create_default_file_icon(false);
+        let folder = create_default_file_icon(true);
+        assert_eq!((file.0, file.1, file.2.len()), (48, 48, 48 * 48 * 4));
+        assert_eq!((folder.0, folder.1, folder.2.len()), (48, 48, 48 * 48 * 4));
+        assert_ne!(file.2, folder.2);
+    }
 
     #[derive(Default)]
     struct FakeImeCursorRectangleSink {
