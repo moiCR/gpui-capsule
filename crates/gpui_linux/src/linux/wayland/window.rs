@@ -1514,8 +1514,18 @@ impl WaylandWindowStatePtr {
                 false
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                // unlike xdg, we don't have a choice here: the surface is closing.
-                true
+                let mut cb = self.callbacks.borrow_mut();
+                if let Some(mut should_close) = cb.should_close.take() {
+                    let result = (should_close)();
+                    cb.should_close = Some(should_close);
+                    if result {
+                        drop(cb);
+                        self.close();
+                    }
+                    result
+                } else {
+                    true
+                }
             }
             _ => false,
         }
